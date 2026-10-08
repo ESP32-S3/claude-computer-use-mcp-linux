@@ -1,0 +1,10 @@
+# Runtime dependencies. On a desktop Ubuntu/Debian these are typically already
+# installed as system packages; prefer apt over pip so PyGObject binds to the
+# system GObject introspection:
+#
+#   sudo apt install python3-evdev python3-gi python3-pil
+#
+# For a venv/pip install instead:
+evdev>=1.6
+PyGObject>=3.42
+Pillow>=9.0
