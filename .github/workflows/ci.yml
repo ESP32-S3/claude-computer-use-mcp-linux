@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  compile-selftest:
+    name: Compile & self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime system deps
+        # Use apt (not pip) so PyGObject binds to the system GObject typelibs,
+        # and run with the system python3 that can see them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi python3-evdev python3-pil gir1.2-glib-2.0
+      - name: Byte-compile
+        run: python3 -m py_compile server.py
+      - name: Self-test (MCP tool schemas + parsing, no display/uinput)
+        run: python3 server.py --selftest
+
+  lint:
+    name: Ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ruff
+        run: python -m pip install --upgrade ruff
+      - name: Lint (real errors only)
+        # E9 = syntax, F63/F7/F82 = logic errors (undefined names, broken excepts).
+        run: ruff check --select E9,F63,F7,F82 .

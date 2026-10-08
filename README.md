@@ -1,5 +1,9 @@
 # Claude Computer Use for Linux (Wayland/GNOME) — `desktop` MCP server
 
+[![CI](https://github.com/ESP32-S3/claude-computer-use-mcp-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/ESP32-S3/claude-computer-use-mcp-linux/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform: Linux Wayland](https://img.shields.io/badge/platform-Linux%20Wayland%2FGNOME-informational)
+
 > Give **Claude** (Claude Code / Claude Desktop / any MCP client) real **computer
 > use** — screenshots, mouse, and keyboard control of your Linux desktop —
 > **where Anthropic's official Computer Use isn't available yet.**

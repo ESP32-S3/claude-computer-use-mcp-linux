@@ -39,18 +39,27 @@ import gi  # noqa: E402
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
-_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+_bus = None
 _shot_seq = 0
+
+
+def _get_bus():
+    """Connect to the session bus lazily (so import works with no bus, e.g. CI)."""
+    global _bus
+    if _bus is None:
+        _bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return _bus
 
 
 def _portal_screenshot() -> str:
     """Trigger a portal screenshot; return the local PNG path."""
     global _shot_seq
     _shot_seq += 1
+    bus = _get_bus()
     token = "cu%d_%d" % (os.getpid(), _shot_seq)
     loop = GLib.MainLoop()
     out = {}
-    sender = _bus.get_unique_name()
+    sender = bus.get_unique_name()
     handle = "/org/freedesktop/portal/desktop/request/%s/%s" % (
         sender[1:].replace(".", "_"), token)
 
@@ -60,7 +69,7 @@ def _portal_screenshot() -> str:
         out["uri"] = res.get("uri", "")
         loop.quit()
 
-    sub = _bus.signal_subscribe(
+    sub = bus.signal_subscribe(
         "org.freedesktop.portal.Desktop",
         "org.freedesktop.portal.Request", "Response", handle, None,
         Gio.DBusSignalFlags.NONE, on_resp)
@@ -68,14 +77,14 @@ def _portal_screenshot() -> str:
         "interactive": GLib.Variant("b", False),
         "handle_token": GLib.Variant("s", token),
     }
-    _bus.call_sync(
+    bus.call_sync(
         "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
         "org.freedesktop.portal.Screenshot", "Screenshot",
         GLib.Variant("(sa{sv})", ("", opts)), None,
         Gio.DBusCallFlags.NONE, 20000, None)
     GLib.timeout_add_seconds(15, lambda: (out.update(code=99), loop.quit()))
     loop.run()
-    _bus.signal_unsubscribe(sub)
+    bus.signal_unsubscribe(sub)
     if out.get("code") != 0 or not out.get("uri"):
         raise RuntimeError("portal screenshot failed (code %s)" % out.get("code"))
     return out["uri"].replace("file://", "")
@@ -92,21 +101,30 @@ def _png_size(path: str):
 # ---------------------------------------------------------------------------
 from evdev import UInput, AbsInfo, ecodes as E  # noqa: E402
 
-# Detect screen size once from a real screenshot so the pointer's coordinate
-# space is identical to screenshot pixels (click where you see). If that fails
-# (e.g. launched while the screen is locked), fall back to 1920x1080 so the
-# server still comes up instead of being dead for the whole session.
-try:
-    _boot_shot = _portal_screenshot()
-    SCREEN_W, SCREEN_H = _png_size(_boot_shot)
+# Screen size is detected lazily (on first pointer use) from a real screenshot
+# so the pointer's coordinate space is identical to screenshot pixels (click
+# where you see). Keeping it lazy means import touches no display/hardware, so
+# the server can be imported and self-tested in CI. Falls back to 1920x1080 if
+# detection fails (e.g. launched while the screen is locked).
+SCREEN_W = None
+SCREEN_H = None
+
+
+def _ensure_screen():
+    global SCREEN_W, SCREEN_H
+    if SCREEN_W is not None:
+        return
     try:
-        os.remove(_boot_shot)
-    except OSError:
-        pass
-    log("screen detected: %dx%d" % (SCREEN_W, SCREEN_H))
-except Exception as _exc:
-    SCREEN_W, SCREEN_H = 1920, 1080
-    log("screen detect failed (%s); defaulting to %dx%d" % (_exc, SCREEN_W, SCREEN_H))
+        shot = _portal_screenshot()
+        SCREEN_W, SCREEN_H = _png_size(shot)
+        try:
+            os.remove(shot)
+        except OSError:
+            pass
+        log("screen detected: %dx%d" % (SCREEN_W, SCREEN_H))
+    except Exception as exc:
+        SCREEN_W, SCREEN_H = 1920, 1080
+        log("screen detect failed (%s); defaulting to %dx%d" % (exc, SCREEN_W, SCREEN_H))
 
 # ---- US-layout character map: char -> (KEY_code, needs_shift) --------------
 def _mk_char_map():
@@ -165,27 +183,43 @@ MOD_KEYS = {
     "cmd": E.KEY_LEFTMETA, "command": E.KEY_LEFTMETA,
 }
 
-# ---- build the two virtual devices ----------------------------------------
+# ---- virtual devices: created lazily on first use (keeps import hardware-free)
 _all_key_codes = sorted(set(
     [v[0] for v in CHAR_MAP.values()]
     + list(NAMED_KEYS.values()) + list(MOD_KEYS.values())))
-_kbd = UInput({E.EV_KEY: _all_key_codes}, name="Claude Virtual Keyboard")
-
-_ptr = UInput(
-    {
-        E.EV_KEY: [E.BTN_LEFT, E.BTN_RIGHT, E.BTN_MIDDLE],
-        E.EV_ABS: [
-            (E.ABS_X, AbsInfo(0, 0, SCREEN_W - 1, 0, 0, 0)),
-            (E.ABS_Y, AbsInfo(0, 0, SCREEN_H - 1, 0, 0, 0)),
-        ],
-        E.EV_REL: [E.REL_WHEEL, E.REL_HWHEEL],
-    },
-    name="Claude Virtual Pointer",
-)
-time.sleep(0.9)  # let the compositor enumerate the new devices
-_cursor = [SCREEN_W // 2, SCREEN_H // 2]  # last known pointer position
+_kbd = None
+_ptr = None
+_cursor = None  # last known pointer position, or None until the pointer exists
 
 BUTTONS = {"left": E.BTN_LEFT, "right": E.BTN_RIGHT, "middle": E.BTN_MIDDLE}
+
+
+def _ensure_kbd():
+    global _kbd
+    if _kbd is None:
+        _kbd = UInput({E.EV_KEY: _all_key_codes}, name="Claude Virtual Keyboard")
+        time.sleep(0.6)  # let the compositor enumerate the new device
+    return _kbd
+
+
+def _ensure_pointer():
+    global _ptr, _cursor
+    if _ptr is None:
+        _ensure_screen()
+        _ptr = UInput(
+            {
+                E.EV_KEY: [E.BTN_LEFT, E.BTN_RIGHT, E.BTN_MIDDLE],
+                E.EV_ABS: [
+                    (E.ABS_X, AbsInfo(0, 0, SCREEN_W - 1, 0, 0, 0)),
+                    (E.ABS_Y, AbsInfo(0, 0, SCREEN_H - 1, 0, 0, 0)),
+                ],
+                E.EV_REL: [E.REL_WHEEL, E.REL_HWHEEL],
+            },
+            name="Claude Virtual Pointer",
+        )
+        _cursor = [SCREEN_W // 2, SCREEN_H // 2]
+        time.sleep(0.9)  # let the compositor enumerate the new device
+    return _ptr
 
 
 def _clamp(x, lo, hi):
@@ -193,6 +227,7 @@ def _clamp(x, lo, hi):
 
 
 def ptr_move(x, y):
+    _ensure_pointer()
     x = _clamp(x, 0, SCREEN_W - 1)
     y = _clamp(y, 0, SCREEN_H - 1)
     _ptr.write(E.EV_ABS, E.ABS_X, x)
@@ -221,6 +256,7 @@ def ptr_click(x, y, button="left", count=1):
 
 
 def ptr_scroll(x, y, dy, dx=0):
+    _ensure_pointer()
     if x is not None and y is not None:
         ptr_move(x, y)
     # one wheel detent at a time for smoothness
@@ -290,6 +326,7 @@ def _emit_unicode(ch):
 
 
 def kbd_type(text):
+    _ensure_kbd()
     unsupported = []
     for ch in text:
         spec = CHAR_MAP.get(ch)
@@ -305,6 +342,7 @@ def kbd_type(text):
 
 def kbd_chord(combo):
     """combo like 'ctrl+shift+t' or 'Return' or 'alt+F4'."""
+    _ensure_kbd()
     parts = [p.strip() for p in combo.split("+") if p.strip()]
     mods, mains = [], []
     for p in parts:
@@ -349,7 +387,7 @@ def take_screenshot(mark_cursor=True, max_width=0):
         except OSError:
             pass
     real_w, real_h = img.size
-    if mark_cursor:
+    if mark_cursor and _cursor is not None:
         d = ImageDraw.Draw(img)
         cx, cy = _cursor
         r = 11
@@ -563,12 +601,32 @@ def main():
                     "code": -32603, "message": "internal error"}})
 
 
+def _selftest():
+    """Validate tool schemas and protocol wiring with no display/hardware.
+
+    Used by CI; exits 0 on success, 1 on failure.
+    """
+    expected = {"screenshot", "click", "move", "drag", "scroll", "type", "key"}
+    names = {t["name"] for t in TOOLS}
+    assert names == expected, "tool set mismatch: %s" % (names ^ expected)
+    for t in TOOLS:
+        assert t["inputSchema"]["type"] == "object", t["name"]
+    json.dumps({"tools": TOOLS})  # must be JSON-serializable
+    # exercise the pure (hardware-free) parsing paths
+    assert MOD_KEYS["ctrl"] and NAMED_KEYS["f5"] and CHAR_MAP["A"][1] is True
+    print("selftest OK: %d tools %s" % (len(TOOLS), sorted(names)))
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        _selftest()
+        sys.exit(0)
     try:
         main()
     finally:
-        try:
-            _kbd.close()
-            _ptr.close()
-        except Exception:
-            pass
+        for _dev in (_kbd, _ptr):
+            if _dev is not None:
+                try:
+                    _dev.close()
+                except Exception:
+                    pass
