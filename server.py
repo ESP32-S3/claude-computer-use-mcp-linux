@@ -41,6 +41,10 @@ from gi.repository import Gio, GLib  # noqa: E402
 
 _bus = None
 _shot_seq = 0
+# Path of the most recent portal screenshot, kept only so we can retry its
+# deletion next time if an earlier delete failed (self-healing — we never touch
+# any file but the exact one we just created).
+_last_shot_path = None
 
 
 def _get_bus():
@@ -378,14 +382,34 @@ from PIL import Image, ImageDraw  # noqa: E402
 
 
 def take_screenshot(mark_cursor=True, max_width=0):
+    """Capture the screen, return (base64_png, note).
+
+    The portal writes each capture to ~/Pictures; we read the pixels into memory
+    and delete the file immediately — before the image is even encoded/returned —
+    so nothing accumulates on disk. If a prior delete ever failed, we reap that
+    exact file on the next call (never anything matched by pattern, so the user's
+    own screenshots are safe).
+    """
+    global _last_shot_path
+    # Self-heal: retry a previous capture's deletion if it didn't stick.
+    if _last_shot_path and os.path.exists(_last_shot_path):
+        try:
+            os.remove(_last_shot_path)
+        except OSError:
+            pass
     path = _portal_screenshot()
+    _last_shot_path = path
     try:
-        img = Image.open(path).convert("RGB")
+        img = Image.open(path)
+        img.load()  # force a full read so the file is no longer needed
+        img = img.convert("RGB")
     finally:
         try:
             os.remove(path)
         except OSError:
-            pass
+            pass  # keep _last_shot_path so the next call retries
+        else:
+            _last_shot_path = None  # cleanly gone
     real_w, real_h = img.size
     if mark_cursor and _cursor is not None:
         d = ImageDraw.Draw(img)
